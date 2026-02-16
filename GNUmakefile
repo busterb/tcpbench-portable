@@ -1,9 +1,22 @@
+UNAME_S:=	$(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+CFLAGS+=	-Wall \
+		$(shell pkg-config --cflags libbsd-overlay) \
+		$(shell pkg-config --cflags libtls) \
+		-I/opt/homebrew/include
+LDFLAGS+=	-levent -lm \
+		$(shell pkg-config --libs libbsd-overlay) \
+		$(shell pkg-config --libs libtls) \
+		-L/opt/homebrew/lib
+else
 CFLAGS+=	-D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall \
-		$(shell pkgconf --cflags libbsd-overlay) \
-		$(shell pkgconf --cflags libtls)
+		$(shell pkg-config --cflags libbsd-overlay) \
+		$(shell pkg-config --cflags libtls)
 LDFLAGS+=	-levent -lm -ltls -lcrypto \
-		$(shell pkgconf --libs libbsd-overlay) \
-		$(shell pkgconf --libs libtls)
+		$(shell pkg-config --libs libbsd-overlay) \
+		$(shell pkg-config --libs libtls)
+endif
 BINDIR?=        /usr/local/bin
 MANDIR?=        /usr/local/man/man
 

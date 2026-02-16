@@ -72,6 +72,32 @@
 
 #include "xoshiro256ss.h"
 
+#if defined(__OpenBSD__) || defined(__linux__)
+#define HAVE_TCP_INFO
+#endif
+
+#ifndef SOCK_NONBLOCK
+#define SOCK_NONBLOCK 0
+static int
+accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags)
+{
+	int s, fl;
+
+	(void)flags;
+	if ((s = accept(fd, addr, addrlen)) == -1)
+		return (-1);
+	if ((fl = fcntl(s, F_GETFL)) == -1) {
+		close(s);
+		return (-1);
+	}
+	if (fcntl(s, F_SETFL, fl | O_NONBLOCK) == -1) {
+		close(s);
+		return (-1);
+	}
+	return (s);
+}
+#endif
+
 #define DEFAULT_PORT "12345"
 #define DEFAULT_STATS_INTERVAL 1000 /* ms */
 #define DEFAULT_BUF (256 * 1024)
@@ -158,12 +184,18 @@ static void	saddr_ntop(const struct sockaddr *, socklen_t, char *, size_t);
 static void	set_slice_timer(int);
 static void	print_tcp_header(void);
 static void	list_kvars(void);
+#ifdef HAVE_TCP_INFO
 static void	check_kvar(const char *);
 static char **	check_prepare_kvars(char *);
+#endif
 static void	stats_prepare(struct statctx *);
 static void	summary_display(void);
 static void	tcp_stats_display(unsigned long long, long double, float,
-    struct statctx *, struct tcp_info *);
+    struct statctx *
+#ifdef HAVE_TCP_INFO
+    , struct tcp_info *
+#endif
+    );
 static void	tcp_process_slice(int, short, void *);
 static void	tcp_server_handle_sc(int, short, void *);
 static int	timeout_tls(int, struct tls *, int (*)(struct tls *));
@@ -207,6 +239,7 @@ static struct {
 
 /* When adding variables, also add to tcp_stats_display() */
 static const char *allowed_kvars[] = {
+#ifdef HAVE_TCP_INFO
 	"last_ack_recv",
 	"last_ack_sent",
 	"last_data_recv",
@@ -265,6 +298,7 @@ static const char *allowed_kvars[] = {
 	"ts_recent",
 	"ts_recent_age",
 #endif
+#endif /* HAVE_TCP_INFO */
 	NULL
 };
 
@@ -383,6 +417,7 @@ print_tcp_header(void)
 	printf("\n");
 }
 
+#ifdef HAVE_TCP_INFO
 static void
 check_kvar(const char *var)
 {
@@ -393,6 +428,7 @@ check_kvar(const char *var)
 			return;
 	errx(1, "Unrecognised kvar: %s", var);
 }
+#endif
 
 static void
 list_kvars(void)
@@ -404,6 +440,7 @@ list_kvars(void)
 		printf("\t%s\n", allowed_kvars[i]);
 }
 
+#ifdef HAVE_TCP_INFO
 static char **
 check_prepare_kvars(char *list)
 {
@@ -420,6 +457,7 @@ check_prepare_kvars(char *list)
 	}
 	return (ret);
 }
+#endif /* HAVE_TCP_INFO */
 
 /*
  * Fill buffer with PRBS data for sending.
@@ -788,10 +826,12 @@ summary_display(void)
 
 static void
 tcp_stats_display(unsigned long long total_elapsed, long double mbps,
-    float bwperc, struct statctx *sc, struct tcp_info *tcpi)
+    float bwperc, struct statctx *sc
+#ifdef HAVE_TCP_INFO
+    , struct tcp_info *tcpi
+#endif
+    )
 {
-	int j;
-
 	printf("%12llu %14llu %12.3Lf %7.2f%% ", total_elapsed, sc->bytes,
 	    mbps, bwperc);
 
@@ -800,7 +840,9 @@ tcp_stats_display(unsigned long long total_elapsed, long double mbps,
 		    (unsigned long long)sc->bytes_verified,
 		    (unsigned long long)sc->verify_errors);
 
+#ifdef HAVE_TCP_INFO
 	if (ptb->kvars != NULL) {
+		int j;
 		for (j = 0; ptb->kvars[j] != NULL; j++) {
 #define S(a) #a
 #define P(b, v, f)							\
@@ -870,6 +912,7 @@ tcp_stats_display(unsigned long long total_elapsed, long double mbps,
 #undef P
 		}
 	}
+#endif /* HAVE_TCP_INFO */
 	printf("\n");
 }
 
@@ -881,8 +924,10 @@ tcp_process_slice(int fd, short event, void *bula)
 	float bwperc;
 	struct statctx *sc;
 	struct timeval t_cur, t_diff;
+#ifdef HAVE_TCP_INFO
 	struct tcp_info tcpi;
 	socklen_t tcpilen;
+#endif
 
 	if (TAILQ_EMPTY(&sc_queue))
 		return; /* don't pollute stats */
@@ -892,12 +937,14 @@ tcp_process_slice(int fd, short event, void *bula)
 	TAILQ_FOREACH(sc, &sc_queue, entry) {
 		if (clock_gettime_tv(CLOCK_MONOTONIC, &t_cur) == -1)
 			err(1, "clock_gettime_tv");
+#ifdef HAVE_TCP_INFO
 		if (ptb->kvars != NULL) { /* process kernel stats */
 			tcpilen = sizeof(tcpi);
 			if (getsockopt(sc->fd, IPPROTO_TCP, TCP_INFO,
 			    &tcpi, &tcpilen) == -1)
 				err(1, "get tcp_info");
 		}
+#endif
 
 		timersub(&t_cur, &sc->t_start, &t_diff);
 		total_elapsed = t_diff.tv_sec * 1000 + t_diff.tv_usec / 1000;
@@ -909,7 +956,11 @@ tcp_process_slice(int fd, short event, void *bula)
 		mbps = (sc->bytes * 8) / (since_last * 1000.0);
 		slice_mbps += mbps;
 
+#ifdef HAVE_TCP_INFO
 		tcp_stats_display(total_elapsed, mbps, bwperc, sc, &tcpi);
+#else
+		tcp_stats_display(total_elapsed, mbps, bwperc, sc);
+#endif
 
 		sc->t_last = t_cur;
 		sc->bytes = 0;
@@ -1639,7 +1690,9 @@ main(int argc, char **argv)
 #else
 	unsigned int secs;
 #endif
+#ifdef HAVE_TCP_INFO
 	char *tmp;
+#endif
 	struct addrinfo *aitop, *aib, hints;
 	const char *errstr;
 	struct rlimit rl;
@@ -1702,10 +1755,14 @@ main(int argc, char **argv)
 			list_kvars();
 			exit(0);
 		case 'k':
+#ifndef HAVE_TCP_INFO
+			errx(1, "kvars not supported on this platform");
+#else
 			if ((tmp = strdup(optarg)) == NULL)
 				err(1, "strdup");
 			ptb->kvars = check_prepare_kvars(tmp);
 			free(tmp);
+#endif
 			break;
 		case 'K':
 			keyfile = optarg;
