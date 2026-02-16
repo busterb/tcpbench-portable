@@ -30,8 +30,9 @@ clean:
 	rm -f tcpbench tcpbench.o out *.crt *.key *.req *.srl
 
 install:
-	install -c -m 555 -s tcpbench -D -t ${DESTDIR}${BINDIR}
-	install -c -m 444 tcpbench.1 -D -t ${DESTDIR}${MANDIR}1
+	mkdir -p ${DESTDIR}${BINDIR} ${DESTDIR}${MANDIR}1
+	install -c -s -m 555 tcpbench ${DESTDIR}${BINDIR}/tcpbench
+	install -c -m 444 tcpbench.1 ${DESTDIR}${MANDIR}1/tcpbench.1
 
 .PHONY: test test-localhost test-localhost6 test-tls test-ciphers
 .NOTPARALLEL: test test-localhost test-localhost6 test-tls test-ciphers
