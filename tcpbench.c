@@ -42,9 +42,11 @@
 #include <arpa/inet.h>
 
 #include <unistd.h>
+#include <getopt.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #ifdef __OpenBSD__
@@ -68,6 +70,8 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include "xoshiro256ss.h"
+
 #define DEFAULT_PORT "12345"
 #define DEFAULT_STATS_INTERVAL 1000 /* ms */
 #define DEFAULT_BUF (256 * 1024)
@@ -75,6 +79,14 @@
 #define TCP_MODE !ptb->uflag
 #define UDP_MODE ptb->uflag
 #define MAX_FD 1024
+
+#define VERIFY_MAGIC		"TCPBENCH"
+#define VERIFY_MAGIC_LEN	8
+#define VERIFY_TCP_HDR_LEN	16	/* magic + seed */
+#define VERIFY_UDP_HDR_LEN	24	/* magic + seed + seqno */
+#define MAX_WRITE_SIZE		(64 * 1024)
+
+#define VERIFY_MODE ptb->verify
 
 /* Our tcpbench globals */
 struct {
@@ -88,9 +100,13 @@ struct {
 	int	  Uflag;	/* UNIX (AF_LOCAL) mode */
 	int	  Rflag;	/* randomize client write size */
 	char	**kvars;	/* Kvm enabled vars */
-	char	 *dummybuf;	/* IO buffer */
 	size_t	  dummybuf_len;	/* IO buffer len */
 	struct tls_config *tls_cfg;
+	/* Verify mode */
+	int	  verify;	/* verify mode enabled */
+	int	  Wflag;	/* write size override */
+	uint64_t  base_seed;
+	int	  seed_set;
 } tcpbench, *ptb;
 
 struct tcpservsock {
@@ -110,10 +126,27 @@ struct statctx {
 	struct event ev;
 	/* TCP only */
 	struct tcpservsock *tcp_ts;
+	int conn_id;
 	/* UDP only */
 	u_long udp_slice_pkts;
 	/* TLS context */
 	struct tls *tls;
+	/* Verify mode state */
+	struct xoshiro256ss_state prbs;
+	uint64_t seed;
+	uint64_t bytes_verified;
+	uint64_t verify_errors;
+	uint64_t first_error_offset;
+	uint64_t prbs_leftover;
+	int prbs_leftover_bytes;
+	uint8_t hdr_buf[VERIFY_UDP_HDR_LEN];
+	int hdr_len;
+	int header_done;
+	size_t buf_pos;		/* write position for partial writes */
+	size_t buf_fill;	/* valid bytes in buf */
+	/* UDP verify */
+	uint64_t udp_seqno;
+	uint64_t udp_rx_count;
 };
 
 char *tls_ciphers;
@@ -167,6 +200,9 @@ static struct {
 	int nconns;		        /* connected clients */
 	struct event timer;		/* process timer */
 	const char *host;               /* remote server for display */
+	/* Verify totals */
+	unsigned long long total_verified;
+	unsigned long long total_errors;
 } mainstats;
 
 /* When adding variables, also add to tcp_stats_display() */
@@ -241,10 +277,10 @@ usage(void)
 	    "usage: tcpbench -l\n"
 	    "       tcpbench [-46cDRUuv] [-B buf] [-b sourceaddr] [-k kvars] [-n connections]\n"
 	    "                [-p port] [-r interval] [-S space] [-T keyword] [-t secs]\n"
-	    "                [-V rtable] hostname\n"
+	    "                [-V rtable] [-W writesize] [--verify] [--seed seed] hostname\n"
 	    "       tcpbench -s [-46cDUuv] [-B buf] [-C certfile -K keyfile] [-k kvars]\n"
 	    "                [-p port] [-r interval] [-S space] [-T keyword] [-V rtable]\n"
-	    "                [hostname]\n");
+	    "                [--verify] [hostname]\n");
 	exit(1);
 }
 
@@ -340,6 +376,8 @@ print_tcp_header(void)
 
 	printf("%12s %14s %12s %8s ", "elapsed_ms", "bytes", "mbps",
 	    "bwidth");
+	if (VERIFY_MODE)
+		printf("%10s %8s ", "verified", "errors");
 	for (kv = ptb->kvars;  ptb->kvars != NULL && *kv != NULL; kv++)
 		printf("%s%s", kv != ptb->kvars ? "," : "", *kv);
 	printf("\n");
@@ -383,11 +421,299 @@ check_prepare_kvars(char *list)
 	return (ret);
 }
 
+/*
+ * Fill buffer with PRBS data for sending.
+ * Handles non-8-aligned boundaries by carrying leftover bytes.
+ */
+static size_t
+prbs_fill(struct statctx *sc, char *buf, size_t len)
+{
+	size_t i = 0;
+	uint8_t *p;
+
+	/* Drain leftover bytes from previous fill */
+	if (sc->prbs_leftover_bytes > 0) {
+		p = (uint8_t *)&sc->prbs_leftover +
+		    (8 - sc->prbs_leftover_bytes);
+		while (sc->prbs_leftover_bytes > 0 && i < len) {
+			buf[i++] = *p++;
+			sc->prbs_leftover_bytes--;
+		}
+	}
+
+	while (i + 8 <= len) {
+		uint64_t val = xoshiro256ss_next(&sc->prbs);
+		memcpy(buf + i, &val, 8);
+		i += 8;
+	}
+
+	if (i < len) {
+		sc->prbs_leftover = xoshiro256ss_next(&sc->prbs);
+		p = (uint8_t *)&sc->prbs_leftover;
+		sc->prbs_leftover_bytes = 8;
+		while (i < len) {
+			buf[i++] = *p++;
+			sc->prbs_leftover_bytes--;
+		}
+	}
+
+	return len;
+}
+
+/*
+ * Verify received data against expected PRBS sequence.
+ * Handles non-8-aligned boundaries by carrying leftover bytes.
+ */
+static uint64_t
+prbs_verify(struct statctx *sc, const char *buf, size_t len)
+{
+	uint64_t errors = 0;
+	size_t i = 0;
+	uint8_t *p;
+
+	if (sc->prbs_leftover_bytes > 0) {
+		p = (uint8_t *)&sc->prbs_leftover +
+		    (8 - sc->prbs_leftover_bytes);
+		while (sc->prbs_leftover_bytes > 0 && i < len) {
+			if (*p != (uint8_t)buf[i]) {
+				errors++;
+				if (sc->verify_errors == 0 && errors == 1) {
+					sc->first_error_offset =
+					    sc->bytes_verified + i;
+					if (ptb->vflag)
+						fprintf(stderr,
+						    "verify: conn %d: "
+						    "mismatch at offset %llu: "
+						    "expected 0x%02x got "
+						    "0x%02x\n",
+						    sc->conn_id,
+						    (unsigned long long)
+						    sc->first_error_offset,
+						    *p, (uint8_t)buf[i]);
+				}
+			}
+			p++;
+			i++;
+			sc->prbs_leftover_bytes--;
+		}
+	}
+
+	while (i + 8 <= len) {
+		uint64_t expected = xoshiro256ss_next(&sc->prbs);
+		uint64_t actual;
+		memcpy(&actual, buf + i, 8);
+		if (expected != actual) {
+			uint8_t *ep = (uint8_t *)&expected;
+			for (int j = 0; j < 8; j++) {
+				if (ep[j] != (uint8_t)buf[i + j]) {
+					errors++;
+					if (sc->verify_errors == 0 &&
+					    errors == 1) {
+						sc->first_error_offset =
+						    sc->bytes_verified + i + j;
+						if (ptb->vflag)
+							fprintf(stderr,
+							    "verify: conn %d: "
+							    "mismatch at offset "
+							    "%llu: expected "
+							    "0x%02x got "
+							    "0x%02x\n",
+							    sc->conn_id,
+							    (unsigned long long)
+							    sc->first_error_offset,
+							    ep[j],
+							    (uint8_t)buf[i + j]);
+					}
+				}
+			}
+		}
+		i += 8;
+	}
+
+	if (i < len) {
+		sc->prbs_leftover = xoshiro256ss_next(&sc->prbs);
+		p = (uint8_t *)&sc->prbs_leftover;
+		sc->prbs_leftover_bytes = 8;
+		while (i < len) {
+			if (*p != (uint8_t)buf[i]) {
+				errors++;
+				if (sc->verify_errors == 0 && errors == 1) {
+					sc->first_error_offset =
+					    sc->bytes_verified + i;
+					if (ptb->vflag)
+						fprintf(stderr,
+						    "verify: conn %d: "
+						    "mismatch at offset %llu: "
+						    "expected 0x%02x got "
+						    "0x%02x\n",
+						    sc->conn_id,
+						    (unsigned long long)
+						    sc->first_error_offset,
+						    *p, (uint8_t)buf[i]);
+				}
+			}
+			p++;
+			i++;
+			sc->prbs_leftover_bytes--;
+		}
+	}
+
+	sc->bytes_verified += len;
+	return errors;
+}
+
+/*
+ * Write TCP stream header for verify mode (magic + seed).
+ */
+static void
+tcp_write_verify_header(struct statctx *sc)
+{
+	uint8_t hdr[VERIFY_TCP_HDR_LEN];
+	ssize_t n;
+
+	memcpy(hdr, VERIFY_MAGIC, VERIFY_MAGIC_LEN);
+	memcpy(hdr + VERIFY_MAGIC_LEN, &sc->seed, 8);
+
+	if (sc->tls)
+		n = tls_write(sc->tls, hdr, sizeof(hdr));
+	else
+		n = write(sc->fd, hdr, sizeof(hdr));
+	if (n < 0)
+		err(1, "write verify header");
+	if ((size_t)n != sizeof(hdr))
+		errx(1, "short write on verify header");
+}
+
+/*
+ * Build a self-contained UDP datagram with verify header.
+ */
+static size_t
+udp_build_verify_packet(struct statctx *sc, char *buf, size_t maxlen)
+{
+	struct xoshiro256ss_state dgram_prbs;
+	size_t payload_off = VERIFY_UDP_HDR_LEN;
+	uint64_t seqno = sc->udp_seqno++;
+	size_t payload_len, i;
+
+	if (maxlen < payload_off + 8)
+		errx(1, "write size too small for UDP verify header");
+
+	memcpy(buf, VERIFY_MAGIC, VERIFY_MAGIC_LEN);
+	memcpy(buf + VERIFY_MAGIC_LEN, &sc->seed, 8);
+	memcpy(buf + VERIFY_MAGIC_LEN + 8, &seqno, 8);
+
+	xoshiro256ss_init(&dgram_prbs, sc->seed ^ seqno);
+
+	payload_len = maxlen - payload_off;
+	i = 0;
+	while (i + 8 <= payload_len) {
+		uint64_t val = xoshiro256ss_next(&dgram_prbs);
+		memcpy(buf + payload_off + i, &val, 8);
+		i += 8;
+	}
+	if (i < payload_len) {
+		uint64_t val = xoshiro256ss_next(&dgram_prbs);
+		memcpy(buf + payload_off + i, &val, payload_len - i);
+	}
+
+	return maxlen;
+}
+
+/*
+ * Verify a received UDP datagram.
+ */
+static void
+udp_verify_packet(struct statctx *sc, const char *buf, size_t len)
+{
+	struct xoshiro256ss_state dgram_prbs;
+	uint64_t seed, seqno;
+	size_t payload_off = VERIFY_UDP_HDR_LEN;
+	size_t payload_len, i;
+	const uint8_t *payload;
+
+	if (len < payload_off) {
+		if (ptb->vflag)
+			fprintf(stderr, "verify: runt datagram (%zu bytes)\n",
+			    len);
+		sc->verify_errors++;
+		return;
+	}
+
+	if (memcmp(buf, VERIFY_MAGIC, VERIFY_MAGIC_LEN) != 0) {
+		if (ptb->vflag)
+			fprintf(stderr, "verify: bad magic\n");
+		sc->verify_errors++;
+		return;
+	}
+
+	memcpy(&seed, buf + VERIFY_MAGIC_LEN, 8);
+	memcpy(&seqno, buf + VERIFY_MAGIC_LEN + 8, 8);
+
+	/* Learn seed from first datagram */
+	if (sc->udp_rx_count == 0)
+		sc->seed = seed;
+
+	if (seed != sc->seed) {
+		if (ptb->vflag)
+			fprintf(stderr, "verify: seed mismatch: "
+			    "expected 0x%llx got 0x%llx\n",
+			    (unsigned long long)sc->seed,
+			    (unsigned long long)seed);
+		sc->verify_errors++;
+		return;
+	}
+
+	sc->udp_rx_count++;
+
+	xoshiro256ss_init(&dgram_prbs, seed ^ seqno);
+
+	payload_len = len - payload_off;
+	payload = (const uint8_t *)(buf + payload_off);
+	i = 0;
+	while (i + 8 <= payload_len) {
+		uint64_t expected = xoshiro256ss_next(&dgram_prbs);
+		uint64_t actual;
+		memcpy(&actual, payload + i, 8);
+		if (expected != actual) {
+			uint8_t *ep = (uint8_t *)&expected;
+			for (int j = 0; j < 8; j++) {
+				if (ep[j] != payload[i + j])
+					sc->verify_errors++;
+			}
+		}
+		i += 8;
+	}
+	if (i < payload_len) {
+		uint64_t expected = xoshiro256ss_next(&dgram_prbs);
+		uint8_t *ep = (uint8_t *)&expected;
+		for (size_t j = 0; j < payload_len - i; j++) {
+			if (ep[j] != payload[i + j])
+				sc->verify_errors++;
+		}
+	}
+
+	sc->bytes_verified += payload_len;
+}
+
+static size_t
+get_write_size(struct statctx *sc)
+{
+	size_t blen = sc->buflen;
+
+	if (ptb->Wflag > 0)
+		blen = (size_t)ptb->Wflag;
+	if (blen > sc->buflen)
+		blen = sc->buflen;
+	return blen;
+}
+
 static void
 stats_prepare(struct statctx *sc)
 {
-	sc->buf = ptb->dummybuf;
+	if ((sc->buf = malloc(ptb->dummybuf_len)) == NULL)
+		err(1, "malloc");
 	sc->buflen = ptb->dummybuf_len;
+	arc4random_buf(sc->buf, sc->buflen);
 
 	if (clock_gettime_tv(CLOCK_MONOTONIC, &sc->t_start) == -1)
 		err(1, "clock_gettime_tv");
@@ -424,6 +750,40 @@ summary_display(void)
 	printf("bandwidth min/avg/max/std-dev = %.3Lf/%.3Lf/%.3Lf/%.3Lf Mbps\n",
 	    mainstats.floor_mbps, mainstats.mean_mbps, mainstats.peak_mbps,
 	    std_dev);
+
+	if (VERIFY_MODE) {
+		struct statctx *sc;
+		uint64_t total_errors = 0;
+
+		TAILQ_FOREACH(sc, &sc_queue, entry) {
+			printf("  conn %d: %llu verified, %llu errors",
+			    sc->conn_id,
+			    (unsigned long long)sc->bytes_verified,
+			    (unsigned long long)sc->verify_errors);
+			if (sc->verify_errors > 0)
+				printf(" (first at offset %llu)",
+				    (unsigned long long)sc->first_error_offset);
+			printf("\n");
+			total_errors += sc->verify_errors;
+		}
+		if (UDP_MODE && udp_sc != NULL) {
+			total_errors += udp_sc->verify_errors;
+			printf("  udp: %llu verified, %llu errors, "
+			    "%llu datagrams\n",
+			    (unsigned long long)udp_sc->bytes_verified,
+			    (unsigned long long)udp_sc->verify_errors,
+			    (unsigned long long)udp_sc->udp_rx_count);
+		}
+		if (total_errors == 0)
+			printf("verify: all streams OK "
+			    "(seed 0x%llx)\n",
+			    (unsigned long long)ptb->base_seed);
+		else
+			printf("verify: FAILED - %llu byte errors "
+			    "(seed 0x%llx)\n",
+			    (unsigned long long)total_errors,
+			    (unsigned long long)ptb->base_seed);
+	}
 }
 
 static void
@@ -434,6 +794,11 @@ tcp_stats_display(unsigned long long total_elapsed, long double mbps,
 
 	printf("%12llu %14llu %12.3Lf %7.2f%% ", total_elapsed, sc->bytes,
 	    mbps, bwperc);
+
+	if (VERIFY_MODE)
+		printf("%10llu %8llu ",
+		    (unsigned long long)sc->bytes_verified,
+		    (unsigned long long)sc->verify_errors);
 
 	if (ptb->kvars != NULL) {
 		for (j = 0; ptb->kvars[j] != NULL; j++) {
@@ -608,9 +973,18 @@ udp_process_slice(int fd, short event, void *bula)
 	mainstats.nvariance_mbps += (slice_mbps - old_mean_mbps) *
 				    (slice_mbps - mainstats.mean_mbps);
 
-	printf("Elapsed: %11llu Mbps: %11.3Lf Peak Mbps: %11.3Lf %s PPS: %7llu\n",
-	    total_elapsed, slice_mbps, mainstats.peak_mbps,
-	    ptb->sflag ? "Rx" : "Tx", pps);
+	if (VERIFY_MODE)
+		printf("Elapsed: %11llu Mbps: %11.3Lf Peak Mbps: %11.3Lf "
+		    "%s PPS: %7llu Verified: %llu Errors: %llu\n",
+		    total_elapsed, slice_mbps, mainstats.peak_mbps,
+		    ptb->sflag ? "Rx" : "Tx", pps,
+		    (unsigned long long)udp_sc->bytes_verified,
+		    (unsigned long long)udp_sc->verify_errors);
+	else
+		printf("Elapsed: %11llu Mbps: %11.3Lf Peak Mbps: %11.3Lf "
+		    "%s PPS: %7llu\n",
+		    total_elapsed, slice_mbps, mainstats.peak_mbps,
+		    ptb->sflag ? "Rx" : "Tx", pps);
 
 	/* Clean up this slice time */
 	udp_sc->t_last = t_cur;
@@ -627,7 +1001,7 @@ udp_server_handle_sc(int fd, short event, void *bula)
 	static int first_read = 1;
 	ssize_t n;
 
-	n = read(fd, ptb->dummybuf, ptb->dummybuf_len);
+	n = read(fd, udp_sc->buf, udp_sc->buflen);
 	if (n == 0)
 		return;
 	else if (n == -1) {
@@ -640,9 +1014,17 @@ udp_server_handle_sc(int fd, short event, void *bula)
 		fprintf(stderr, "read: %zd bytes\n", n);
 	if (first_read) {
 		first_read = 0;
-		stats_prepare(udp_sc);
+		if (clock_gettime_tv(CLOCK_MONOTONIC, &udp_sc->t_start) == -1)
+			err(1, "clock_gettime_tv");
+		udp_sc->t_last = udp_sc->t_start;
+		if (!timerisset(&mainstats.t_first))
+			mainstats.t_first = udp_sc->t_start;
 		set_slice_timer(1);
 	}
+
+	if (VERIFY_MODE)
+		udp_verify_packet(udp_sc, udp_sc->buf, n);
+
 	/* Account packet */
 	udp_sc->udp_slice_pkts++;
 	udp_sc->bytes += n;
@@ -681,12 +1063,54 @@ tcp_server_handle_sc(int fd, short event, void *v_sc)
 			event_add(&sc->tcp_ts->ev, NULL);
 		}
 
+		free(sc->buf);
 		free(sc);
 		mainstats.nconns--;
 		return;
 	}
 	if (ptb->vflag >= 3)
 		fprintf(stderr, "read: %zd bytes\n", n);
+
+	if (VERIFY_MODE) {
+		char *data = sc->buf;
+		size_t remaining = n;
+
+		/* Parse header if not yet done */
+		if (!sc->header_done) {
+			size_t need = VERIFY_TCP_HDR_LEN - sc->hdr_len;
+			size_t copy = remaining < need ? remaining : need;
+
+			memcpy(sc->hdr_buf + sc->hdr_len, data, copy);
+			sc->hdr_len += copy;
+			data += copy;
+			remaining -= copy;
+
+			if (sc->hdr_len == VERIFY_TCP_HDR_LEN) {
+				if (memcmp(sc->hdr_buf, VERIFY_MAGIC,
+				    VERIFY_MAGIC_LEN) != 0) {
+					fprintf(stderr, "verify: conn %d: "
+					    "bad magic in header\n",
+					    sc->conn_id);
+					sc->verify_errors++;
+				}
+				memcpy(&sc->seed,
+				    sc->hdr_buf + VERIFY_MAGIC_LEN, 8);
+				xoshiro256ss_init(&sc->prbs, sc->seed);
+				sc->header_done = 1;
+				if (ptb->vflag)
+					fprintf(stderr, "verify: conn %d: "
+					    "header parsed, seed 0x%llx\n",
+					    sc->conn_id,
+					    (unsigned long long)sc->seed);
+			}
+		}
+
+		if (sc->header_done && remaining > 0) {
+			uint64_t errs = prbs_verify(sc, data, remaining);
+			sc->verify_errors += errs;
+		}
+	}
+
 	sc->bytes += n;
 	mainstats.slice_bytes += n;
 	mainstats.total_bytes += n;
@@ -776,6 +1200,7 @@ tcp_server_accept(int fd, short event, void *arg)
 		err(1, "calloc");
 	sc->tcp_ts = ts;
 	sc->fd = sock;
+	sc->conn_id = mainstats.nconns;
 	stats_prepare(sc);
 	if (tls && tls_accept_socket(tls, &sc->tls, sc->fd) == -1)
 		err(1, "tls_accept_socket: %s", tls_error(tls));
@@ -896,15 +1321,49 @@ client_handle_sc(int fd, short event, void *v_sc)
 {
 	struct statctx *sc = v_sc;
 	ssize_t n;
-	size_t blen = sc->buflen;
+	size_t blen;
 
-	if (ptb->Rflag)
-		blen = arc4random_uniform(blen) + 1;
+	if (VERIFY_MODE && TCP_MODE) {
+		/* Send header on first call */
+		if (!sc->header_done) {
+			tcp_write_verify_header(sc);
+			sc->header_done = 1;
+		}
 
-	if (sc->tls)
-		n = tls_write(sc->tls, sc->buf, blen);
-	else
+		/* Refill buffer when fully drained */
+		if (sc->buf_pos >= sc->buf_fill) {
+			blen = get_write_size(sc);
+			prbs_fill(sc, sc->buf, blen);
+			sc->buf_fill = blen;
+			sc->buf_pos = 0;
+		}
+
+		if (sc->tls)
+			n = tls_write(sc->tls, sc->buf + sc->buf_pos,
+			    sc->buf_fill - sc->buf_pos);
+		else
+			n = write(sc->fd, sc->buf + sc->buf_pos,
+			    sc->buf_fill - sc->buf_pos);
+	} else if (VERIFY_MODE && UDP_MODE) {
+		blen = get_write_size(sc);
+		udp_build_verify_packet(sc, sc->buf, blen);
 		n = write(sc->fd, sc->buf, blen);
+	} else {
+		blen = sc->buflen;
+		if (ptb->Wflag > 0) {
+			blen = (size_t)ptb->Wflag;
+			if (blen > sc->buflen)
+				blen = sc->buflen;
+		}
+		if (ptb->Rflag)
+			blen = arc4random_uniform(blen) + 1;
+
+		if (sc->tls)
+			n = tls_write(sc->tls, sc->buf, blen);
+		else
+			n = write(sc->fd, sc->buf, blen);
+	}
+
 	if (n == -1) {
 		if (sc->tls)
 			warn("tls_write: %s", tls_error(sc->tls));
@@ -920,6 +1379,10 @@ client_handle_sc(int fd, short event, void *v_sc)
 	}
 	if (ptb->vflag >= 3)
 		fprintf(stderr, "write: %zd bytes\n", n);
+
+	if (VERIFY_MODE && TCP_MODE)
+		sc->buf_pos += n;
+
 	sc->bytes += n;
 	mainstats.slice_bytes += n;
 	mainstats.total_bytes += n;
@@ -1006,6 +1469,12 @@ client_init(struct addrinfo *aitop, int nconn, struct addrinfo *aib)
 			sc = udp_sc;
 
 		sc->fd = sock;
+		sc->conn_id = i;
+
+		if (VERIFY_MODE) {
+			sc->seed = ptb->base_seed ^ (uint64_t)i;
+			xoshiro256ss_init(&sc->prbs, sc->seed);
+		}
 
 		if (ptb->tls_cfg) {
 			sc->tls = tls_client();
@@ -1201,7 +1670,14 @@ main(int argc, char **argv)
 	aib = NULL;
 	secs = 0;
 
-	while ((ch = getopt(argc, argv, "46b:B:cC:Dhlk:K:n:p:Rr:sS:t:T:uUvV:"))
+	static struct option longopts[] = {
+		{ "verify",	no_argument,		NULL, 0x100 },
+		{ "seed",	required_argument,	NULL, 0x101 },
+		{ NULL,		0,			NULL, 0 }
+	};
+
+	while ((ch = getopt_long(argc, argv,
+	    "46b:B:cC:Dhlk:K:n:p:Rr:sS:t:T:uUvV:W:", longopts, NULL))
 	    != -1) {
 		switch (ch) {
 		case '4':
@@ -1312,6 +1788,20 @@ main(int argc, char **argv)
 			if (errstr != NULL)
 				errx(1, "secs is %s: %s",
 				    errstr, optarg);
+			break;
+		case 'W':
+			ptb->Wflag = strtonum(optarg, 1, MAX_WRITE_SIZE,
+			    &errstr);
+			if (errstr != NULL)
+				errx(1, "write size is %s: %s",
+				    errstr, optarg);
+			break;
+		case 0x100:	/* --verify */
+			ptb->verify = 1;
+			break;
+		case 0x101:	/* --seed */
+			ptb->base_seed = strtoull(optarg, NULL, 0);
+			ptb->seed_set = 1;
 			break;
 		case 'h':
 		default:
@@ -1455,9 +1945,13 @@ main(int argc, char **argv)
 
 	/* Init world */
 	TAILQ_INIT(&sc_queue);
-	if ((ptb->dummybuf = malloc(ptb->dummybuf_len)) == NULL)
-		err(1, "malloc");
-	arc4random_buf(ptb->dummybuf, ptb->dummybuf_len);
+
+	if (VERIFY_MODE && !ptb->seed_set) {
+		arc4random_buf(&ptb->base_seed, sizeof(ptb->base_seed));
+	}
+	if (VERIFY_MODE && ptb->vflag)
+		fprintf(stderr, "verify: base seed 0x%llx\n",
+		    (unsigned long long)ptb->base_seed);
 
 	timerclear(&mainstats.t_first);
 	mainstats.floor_mbps = INFINITY;
@@ -1482,6 +1976,14 @@ main(int argc, char **argv)
 		if ((udp_sc = calloc(1, sizeof(*udp_sc))) == NULL)
 			err(1, "calloc");
 		udp_sc->fd = -1;
+		if ((udp_sc->buf = malloc(ptb->dummybuf_len)) == NULL)
+			err(1, "malloc");
+		udp_sc->buflen = ptb->dummybuf_len;
+		arc4random_buf(udp_sc->buf, udp_sc->buflen);
+		if (VERIFY_MODE) {
+			udp_sc->seed = ptb->base_seed;
+			xoshiro256ss_init(&udp_sc->prbs, udp_sc->seed);
+		}
 		evtimer_set(&mainstats.timer, udp_process_slice, NULL);
 	} else {
 		print_tcp_header();
