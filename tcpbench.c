@@ -74,6 +74,12 @@
 
 #if defined(__OpenBSD__) || defined(__linux__)
 #define HAVE_TCP_INFO
+typedef struct tcp_info		tcp_info_t;
+#define TCP_INFO_OPT		TCP_INFO
+#elif defined(__APPLE__)
+#define HAVE_TCP_INFO
+typedef struct tcp_connection_info tcp_info_t;
+#define TCP_INFO_OPT		TCP_CONNECTION_INFO
 #endif
 
 #ifndef SOCK_NONBLOCK
@@ -193,7 +199,7 @@ static void	summary_display(void);
 static void	tcp_stats_display(unsigned long long, long double, float,
     struct statctx *
 #ifdef HAVE_TCP_INFO
-    , struct tcp_info *
+    , tcp_info_t *
 #endif
     );
 static void	tcp_process_slice(int, short, void *);
@@ -240,10 +246,15 @@ static struct {
 /* When adding variables, also add to tcp_stats_display() */
 static const char *allowed_kvars[] = {
 #ifdef HAVE_TCP_INFO
+#if defined(__OpenBSD__) || defined(__linux__)
 	"last_ack_recv",
 	"last_ack_sent",
 	"last_data_recv",
 	"last_data_sent",
+#endif
+#ifdef __APPLE__
+	"maxseg",
+#endif
 #ifdef __OpenBSD__
 	"max_sndwnd",
 #endif
@@ -251,41 +262,68 @@ static const char *allowed_kvars[] = {
 #ifdef __OpenBSD__
 	"rcv_adv",
 #endif
+#if defined(__OpenBSD__) || defined(__linux__)
 	"rcv_mss",
+#endif
 #ifdef __OpenBSD__
 	"rcv_nxt",
 	"rcv_ooopack",
 #endif
+#if defined(__OpenBSD__) || defined(__linux__)
 	"rcv_space",
+#endif
 #ifdef __OpenBSD__
 	"rcv_up",
 #endif
 	"rcv_wscale",
+#ifdef __APPLE__
+	"rcv_wnd",
+#endif
 #ifdef __OpenBSD__
 	"rfbuf_cnt",
 	"rfbuf_ts",
 #endif
+#if defined(__OpenBSD__) || defined(__linux__)
 	"rtt",
+#endif
+#ifdef __APPLE__
+	"rttcur",
+	"rto",
+#endif
 #ifdef __OpenBSD__
 	"rttmin",
 #endif
 	"rttvar",
+#ifdef __APPLE__
+	"rxbytes",
+	"rxoutoforderbytes",
+	"rxpackets",
+#endif
 	"snd_cwnd",
 #ifdef __OpenBSD__
 	"snd_max",
 #endif
+#if defined(__OpenBSD__) || defined(__linux__)
 	"snd_mss",
+#endif
 #ifdef __OpenBSD__
 	"snd_nxt",
 	"snd_rexmitpack",
+#endif
+#ifdef __APPLE__
+	"snd_sbbytes",
 #endif
 	"snd_ssthresh",
 #ifdef __OpenBSD__
 	"snd_una",
 	"snd_wl1",
 	"snd_wl2",
+#endif
+#if defined(__OpenBSD__) || defined(__APPLE__)
 	"snd_wnd",
 	"snd_wscale",
+#endif
+#ifdef __OpenBSD__
 	"snd_zerowin",
 	"so_rcv_sb_cc",
 	"so_rcv_sb_hiwat",
@@ -295,8 +333,19 @@ static const char *allowed_kvars[] = {
 	"so_snd_sb_hiwat",
 	"so_snd_sb_lowat",
 	"so_snd_sb_wat",
+#endif
+#ifdef __APPLE__
+	"srtt",
+#endif
+#ifdef __OpenBSD__
 	"ts_recent",
 	"ts_recent_age",
+#endif
+#ifdef __APPLE__
+	"txbytes",
+	"txpackets",
+	"txretransmitbytes",
+	"txretransmitpackets",
 #endif
 #endif /* HAVE_TCP_INFO */
 	NULL
@@ -828,7 +877,7 @@ static void
 tcp_stats_display(unsigned long long total_elapsed, long double mbps,
     float bwperc, struct statctx *sc
 #ifdef HAVE_TCP_INFO
-    , struct tcp_info *tcpi
+    , tcp_info_t *tcpi
 #endif
     )
 {
@@ -850,52 +899,94 @@ tcp_stats_display(unsigned long long total_elapsed, long double mbps,
 				printf("%s"f, j > 0 ? "," : "", b->tcpi_##v); \
 				continue;				\
 			}
+#define PL(b, v, f)							\
+			if (strcmp(ptb->kvars[j], S(v)) == 0) {		\
+				printf("%s"f, j > 0 ? "," : "",		\
+				    (unsigned long long)b->tcpi_##v);	\
+				continue;				\
+			}
+#if defined(__OpenBSD__) || defined(__linux__)
 			P(tcpi, last_ack_recv, "%u")
 			P(tcpi, last_ack_sent, "%u")
 			P(tcpi, last_data_recv, "%u")
 			P(tcpi, last_data_sent, "%u")
+#endif
+#ifdef __APPLE__
+			P(tcpi, maxseg, "%u")
+#endif
 #ifdef __OpenBSD__
 			P(tcpi, max_sndwnd, "%u")
 #endif
+#ifdef __APPLE__
+			P(tcpi, options, "%u")
+#else
 			P(tcpi, options, "%hhu")
+#endif
 #ifdef __OpenBSD__
 			P(tcpi, rcv_adv, "%u")
 #endif
+#if defined(__OpenBSD__) || defined(__linux__)
 			P(tcpi, rcv_mss, "%u")
+#endif
 #ifdef __OpenBSD__
 			P(tcpi, rcv_nxt, "%u")
 			P(tcpi, rcv_ooopack, "%u")
 #endif
+#if defined(__OpenBSD__) || defined(__linux__)
 			P(tcpi, rcv_space, "%u")
+#endif
 #ifdef __OpenBSD__
 			P(tcpi, rcv_up, "%u")
 #endif
 			P(tcpi, rcv_wscale, "%hhu")
+#ifdef __APPLE__
+			P(tcpi, rcv_wnd, "%u")
+#endif
 #ifdef __OpenBSD__
 			P(tcpi, rfbuf_cnt, "%u")
 			P(tcpi, rfbuf_ts, "%u")
 #endif
+#if defined(__OpenBSD__) || defined(__linux__)
 			P(tcpi, rtt, "%u")
+#endif
+#ifdef __APPLE__
+			P(tcpi, rttcur, "%u")
+			P(tcpi, rto, "%u")
+#endif
 #ifdef __OpenBSD__
 			P(tcpi, rttmin, "%u")
 #endif
 			P(tcpi, rttvar, "%u")
+#ifdef __APPLE__
+			PL(tcpi, rxbytes, "%llu")
+			PL(tcpi, rxoutoforderbytes, "%llu")
+			PL(tcpi, rxpackets, "%llu")
+#endif
 			P(tcpi, snd_cwnd, "%u")
 #ifdef __OpenBSD__
 			P(tcpi, snd_max, "%u")
 #endif
+#if defined(__OpenBSD__) || defined(__linux__)
 			P(tcpi, snd_mss, "%u")
+#endif
 #ifdef __OpenBSD__
 			P(tcpi, snd_nxt, "%u")
 			P(tcpi, snd_rexmitpack, "%u")
+#endif
+#ifdef __APPLE__
+			P(tcpi, snd_sbbytes, "%u")
 #endif
 			P(tcpi, snd_ssthresh, "%u")
 #ifdef __OpenBSD__
 			P(tcpi, snd_una, "%u")
 			P(tcpi, snd_wl1, "%u")
 			P(tcpi, snd_wl2, "%u")
+#endif
+#if defined(__OpenBSD__) || defined(__APPLE__)
 			P(tcpi, snd_wnd, "%u")
 			P(tcpi, snd_wscale, "%hhu")
+#endif
+#ifdef __OpenBSD__
 			P(tcpi, snd_zerowin, "%u")
 			P(tcpi, so_rcv_sb_cc, "%u")
 			P(tcpi, so_rcv_sb_hiwat, "%u")
@@ -905,11 +996,23 @@ tcp_stats_display(unsigned long long total_elapsed, long double mbps,
 			P(tcpi, so_snd_sb_hiwat, "%u")
 			P(tcpi, so_snd_sb_lowat, "%u")
 			P(tcpi, so_snd_sb_wat, "%u")
+#endif
+#ifdef __APPLE__
+			P(tcpi, srtt, "%u")
+#endif
+#ifdef __OpenBSD__
 			P(tcpi, ts_recent, "%u")
 			P(tcpi, ts_recent_age, "%u")
 #endif
+#ifdef __APPLE__
+			PL(tcpi, txbytes, "%llu")
+			PL(tcpi, txpackets, "%llu")
+			PL(tcpi, txretransmitbytes, "%llu")
+			PL(tcpi, txretransmitpackets, "%llu")
+#endif
 #undef S
 #undef P
+#undef PL
 		}
 	}
 #endif /* HAVE_TCP_INFO */
@@ -925,7 +1028,7 @@ tcp_process_slice(int fd, short event, void *bula)
 	struct statctx *sc;
 	struct timeval t_cur, t_diff;
 #ifdef HAVE_TCP_INFO
-	struct tcp_info tcpi;
+	tcp_info_t tcpi;
 	socklen_t tcpilen;
 #endif
 
@@ -940,7 +1043,7 @@ tcp_process_slice(int fd, short event, void *bula)
 #ifdef HAVE_TCP_INFO
 		if (ptb->kvars != NULL) { /* process kernel stats */
 			tcpilen = sizeof(tcpi);
-			if (getsockopt(sc->fd, IPPROTO_TCP, TCP_INFO,
+			if (getsockopt(sc->fd, IPPROTO_TCP, TCP_INFO_OPT,
 			    &tcpi, &tcpilen) == -1)
 				err(1, "get tcp_info");
 		}
@@ -1690,9 +1793,7 @@ main(int argc, char **argv)
 #else
 	unsigned int secs;
 #endif
-#ifdef HAVE_TCP_INFO
 	char *tmp;
-#endif
 	struct addrinfo *aitop, *aib, hints;
 	const char *errstr;
 	struct rlimit rl;
@@ -1755,13 +1856,13 @@ main(int argc, char **argv)
 			list_kvars();
 			exit(0);
 		case 'k':
-#ifndef HAVE_TCP_INFO
-			errx(1, "kvars not supported on this platform");
-#else
+#ifdef HAVE_TCP_INFO
 			if ((tmp = strdup(optarg)) == NULL)
 				err(1, "strdup");
 			ptb->kvars = check_prepare_kvars(tmp);
 			free(tmp);
+#else
+			errx(1, "kvars not supported on this platform");
 #endif
 			break;
 		case 'K':
