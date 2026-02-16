@@ -1435,20 +1435,47 @@ client_handle_sc(int fd, short event, void *v_sc)
 			sc->header_done = 1;
 		}
 
-		/* Refill buffer when fully drained */
-		if (sc->buf_pos >= sc->buf_fill) {
-			blen = get_write_size(sc);
-			prbs_fill(sc, sc->buf, blen);
-			sc->buf_fill = blen;
-			sc->buf_pos = 0;
-		}
+		/*
+		 * Write in a loop to reduce event dispatch overhead.
+		 * Refill and drain the buffer repeatedly until the
+		 * kernel send buffer is full (EWOULDBLOCK).
+		 */
+		for (;;) {
+			if (sc->buf_pos >= sc->buf_fill) {
+				blen = get_write_size(sc);
+				prbs_fill(sc, sc->buf, blen);
+				sc->buf_fill = blen;
+				sc->buf_pos = 0;
+			}
 
-		if (sc->tls)
-			n = tls_write(sc->tls, sc->buf + sc->buf_pos,
-			    sc->buf_fill - sc->buf_pos);
-		else
-			n = write(sc->fd, sc->buf + sc->buf_pos,
-			    sc->buf_fill - sc->buf_pos);
+			if (sc->tls)
+				n = tls_write(sc->tls, sc->buf + sc->buf_pos,
+				    sc->buf_fill - sc->buf_pos);
+			else
+				n = write(sc->fd, sc->buf + sc->buf_pos,
+				    sc->buf_fill - sc->buf_pos);
+			if (n <= 0)
+				break;
+			sc->buf_pos += n;
+			sc->bytes += n;
+			mainstats.slice_bytes += n;
+			mainstats.total_bytes += n;
+			if (ptb->vflag >= 3)
+				fprintf(stderr, "write: %zd bytes\n", n);
+		}
+		if (n == -1) {
+			if (sc->tls)
+				warn("tls_write: %s", tls_error(sc->tls));
+			if (errno == EINTR || errno == EWOULDBLOCK)
+				return;
+			warn("write");
+			wrapup(1);
+		}
+		if (n == 0) {
+			fprintf(stderr, "Remote end closed connection");
+			wrapup(1);
+		}
+		return;
 	} else if (VERIFY_MODE && UDP_MODE) {
 		blen = get_write_size(sc);
 		udp_build_verify_packet(sc, sc->buf, blen);
@@ -1484,9 +1511,6 @@ client_handle_sc(int fd, short event, void *v_sc)
 	}
 	if (ptb->vflag >= 3)
 		fprintf(stderr, "write: %zd bytes\n", n);
-
-	if (VERIFY_MODE && TCP_MODE)
-		sc->buf_pos += n;
 
 	sc->bytes += n;
 	mainstats.slice_bytes += n;
