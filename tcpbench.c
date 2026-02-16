@@ -549,55 +549,34 @@ prbs_fill(struct statctx *sc, char *buf, size_t len)
 
 /*
  * Verify received data against expected PRBS sequence.
- * Handles non-8-aligned boundaries by carrying leftover bytes.
+ * Generates expected data in chunks via prbs_fill, then uses memcmp
+ * for bulk comparison. Falls back to byte-by-byte only on mismatch.
  */
+#define VERIFY_CHUNK 8192
+
 static uint64_t
 prbs_verify(struct statctx *sc, const char *buf, size_t len)
 {
+	char expected[VERIFY_CHUNK];
 	uint64_t errors = 0;
-	size_t i = 0;
-	uint8_t *p;
+	size_t off = 0;
 
-	if (sc->prbs_leftover_bytes > 0) {
-		p = (uint8_t *)&sc->prbs_leftover +
-		    (8 - sc->prbs_leftover_bytes);
-		while (sc->prbs_leftover_bytes > 0 && i < len) {
-			if (*p != (uint8_t)buf[i]) {
-				errors++;
-				if (sc->verify_errors == 0 && errors == 1) {
-					sc->first_error_offset =
-					    sc->bytes_verified + i;
-					if (ptb->vflag)
-						fprintf(stderr,
-						    "verify: conn %d: "
-						    "mismatch at offset %llu: "
-						    "expected 0x%02x got "
-						    "0x%02x\n",
-						    sc->conn_id,
-						    (unsigned long long)
-						    sc->first_error_offset,
-						    *p, (uint8_t)buf[i]);
-				}
-			}
-			p++;
-			i++;
-			sc->prbs_leftover_bytes--;
-		}
-	}
+	while (off < len) {
+		size_t chunk = len - off;
+		if (chunk > VERIFY_CHUNK)
+			chunk = VERIFY_CHUNK;
 
-	while (i + 8 <= len) {
-		uint64_t expected = xoshiro256ss_next(&sc->prbs);
-		uint64_t actual;
-		memcpy(&actual, buf + i, 8);
-		if (expected != actual) {
-			uint8_t *ep = (uint8_t *)&expected;
-			for (int j = 0; j < 8; j++) {
-				if (ep[j] != (uint8_t)buf[i + j]) {
+		prbs_fill(sc, expected, chunk);
+
+		if (memcmp(expected, buf + off, chunk) != 0) {
+			for (size_t j = 0; j < chunk; j++) {
+				if (expected[j] != buf[off + j]) {
 					errors++;
 					if (sc->verify_errors == 0 &&
 					    errors == 1) {
 						sc->first_error_offset =
-						    sc->bytes_verified + i + j;
+						    sc->bytes_verified +
+						    off + j;
 						if (ptb->vflag)
 							fprintf(stderr,
 							    "verify: conn %d: "
@@ -608,41 +587,13 @@ prbs_verify(struct statctx *sc, const char *buf, size_t len)
 							    sc->conn_id,
 							    (unsigned long long)
 							    sc->first_error_offset,
-							    ep[j],
-							    (uint8_t)buf[i + j]);
+							    (uint8_t)expected[j],
+							    (uint8_t)buf[off + j]);
 					}
 				}
 			}
 		}
-		i += 8;
-	}
-
-	if (i < len) {
-		sc->prbs_leftover = xoshiro256ss_next(&sc->prbs);
-		p = (uint8_t *)&sc->prbs_leftover;
-		sc->prbs_leftover_bytes = 8;
-		while (i < len) {
-			if (*p != (uint8_t)buf[i]) {
-				errors++;
-				if (sc->verify_errors == 0 && errors == 1) {
-					sc->first_error_offset =
-					    sc->bytes_verified + i;
-					if (ptb->vflag)
-						fprintf(stderr,
-						    "verify: conn %d: "
-						    "mismatch at offset %llu: "
-						    "expected 0x%02x got "
-						    "0x%02x\n",
-						    sc->conn_id,
-						    (unsigned long long)
-						    sc->first_error_offset,
-						    *p, (uint8_t)buf[i]);
-				}
-			}
-			p++;
-			i++;
-			sc->prbs_leftover_bytes--;
-		}
+		off += chunk;
 	}
 
 	sc->bytes_verified += len;
