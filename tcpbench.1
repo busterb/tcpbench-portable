@@ -35,6 +35,9 @@
 .Op Fl T Ar keyword
 .Op Fl t Ar secs
 .Op Fl V Ar rtable
+.Op Fl W Ar writesize
+.Op Fl -verify
+.Op Fl -seed Ar seed
 .Ar hostname
 .Nm
 .Bk -words
@@ -48,6 +51,7 @@
 .Op Fl S Ar space
 .Op Fl T Ar keyword
 .Op Fl V Ar rtable
+.Op Fl -verify
 .Op Ar hostname
 .Ek
 .Sh DESCRIPTION
@@ -77,6 +81,19 @@ option, which is only available in TCP mode).
 A list of available kernel variables may be obtained using the
 .Fl l
 option.
+.Pp
+When the
+.Fl -verify
+option is used, the client generates pseudo-random data using a PRBS
+(pseudo-random binary sequence) and the server verifies received data
+against the expected sequence.
+A per-connection summary of verified bytes and any errors is displayed
+on exit.
+Both the client and server must specify
+.Fl -verify .
+The seed may be set with
+.Fl -seed
+for reproducible test runs.
 .Pp
 A summary over the periodic throughput statistics is displayed on exit.
 Its accuracy may be increased by decreasing the
@@ -216,6 +233,29 @@ Set the routing table to be used.
 .It Fl v
 Display verbose output.
 If specified more than once, increase the detail of information displayed.
+.It Fl W Ar writesize
+Set the write size per send call, in bytes.
+The maximum is 65536.
+The default is the full buffer size.
+.It Fl -seed Ar seed
+Set the PRBS seed for
+.Fl -verify
+mode.
+.Ar seed
+may be specified in decimal or hexadecimal with a
+.Ql 0x
+prefix.
+The default is a randomly generated seed.
+This option is only valid for the client.
+.It Fl -verify
+Enable data integrity verification mode.
+The client generates pseudo-random data and the server verifies it
+against the expected sequence.
+Both the client and server must specify this option.
+In TCP mode, a stream header containing the seed is sent at connection
+setup.
+In UDP mode, each datagram is self-contained with its own header.
+A per-connection summary of verified bytes and errors is displayed on exit.
 .El
 .Sh SEE ALSO
 .Xr netstat 1 ,
